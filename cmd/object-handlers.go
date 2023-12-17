@@ -689,6 +689,21 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 	})
 }
 
+// ---------------------------
+/*
+*
+添加：韦廷科weitinke
+获取URL的get参数
+*/
+func GetUrlArgs(r *http.Request, name string) string {
+	var arg string
+	values := r.URL.Query()
+	arg = values.Get(name)
+	return arg
+}
+
+// --------end---------------
+
 // GetObjectHandler - GET Object
 // ----------
 // This implementation of the GET operation retrieves object. To use GET,
@@ -711,6 +726,14 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+	// 将filename参数值添加到响应头做为响应名
+	var filename string = GetUrlArgs(r, "filename")
+	if filename != "" {
+		// 该写法可以解决中文文件名乱码问题
+		w.Header().Set("Content-Disposition",
+			fmt.Sprintf("attachment; filename*=UTF-8''%s", url.QueryEscape(filename)))
+	}
+	// ------end---------
 	if !globalAPIConfig.shouldGzipObjects() {
 		w.Header().Set(gzhttp.HeaderNoCompression, "true")
 	}

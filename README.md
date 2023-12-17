@@ -1,3 +1,6 @@
+该minio源代码已经别更改，支持在预签名URL中携带filename参数进行下载文件时，自动将filename参数值设置到响应头中的文件名称，以达到自定义下载文件名称
+
+修改及编译步骤：https://blog.csdn.net/a_123_4/article/details/135043709
 # MinIO Quickstart Guide
 
 [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/) [![license](https://img.shields.io/badge/license-AGPL%20V3-blue)](https://github.com/minio/minio/blob/master/LICENSE)

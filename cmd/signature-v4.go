@@ -279,8 +279,15 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 		xhttp.AmzCredential,
 		xhttp.AmzSignature,
 	)
-
+	// 韦廷科，去除URL中的filename参数，签名校验时不进行该参数校验
 	// Add missing query parameters if any provided in the request URL
+	//for k, v := range req.Form {
+	//	if !defaultSigParams.Contains(k) && k != "filename" {
+	//		query[k] = v
+	//	}
+	//}
+
+	// 这里使用原来的代码，需要把filename一起校验，然后上面只用把filename的值设置到响应头中即可
 	for k, v := range req.Form {
 		if !defaultSigParams.Contains(k) {
 			query[k] = v
