@@ -44,7 +44,11 @@ docs/debugging/pprofgoparser/pprofgoparser
 docs/debugging/reorder-disks/reorder-disks
 docs/debugging/populate-hard-links/populate-hardlinks
 <<<<<<< HEAD
+<<<<<<< HEAD
 minio-wtk
+=======
+docs/debugging/xattr/xattr
+>>>>>>> ee158e16108796d1c1863f869d5d7ce9511850bd
 =======
 docs/debugging/xattr/xattr
 >>>>>>> ee158e16108796d1c1863f869d5d7ce9511850bd
