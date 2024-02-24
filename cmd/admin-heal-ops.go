@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 )
 
@@ -132,7 +133,13 @@ func (ahs *allHealState) popHealLocalDisks(healLocalDisks ...Endpoint) {
 func (ahs *allHealState) updateHealStatus(tracker *healingTracker) {
 	ahs.Lock()
 	defer ahs.Unlock()
-	ahs.healStatus[tracker.ID] = *tracker
+
+	tracker.mu.RLock()
+	t := *tracker
+	t.QueuedBuckets = append(make([]string, 0, len(tracker.QueuedBuckets)), tracker.QueuedBuckets...)
+	t.HealedBuckets = append(make([]string, 0, len(tracker.HealedBuckets)), tracker.HealedBuckets...)
+	ahs.healStatus[tracker.ID] = t
+	tracker.mu.RUnlock()
 }
 
 // Sort by zone, set and disk index
@@ -706,7 +713,7 @@ func (h *healSequence) queueHealTask(source healSource, healType madmin.HealItem
 		select {
 		case globalBackgroundHealRoutine.tasks <- task:
 			if serverDebugLog {
-				logger.Info("Task in the queue: %#v", task)
+				fmt.Printf("Task in the queue: %#v\n", task)
 			}
 		default:
 			// task queue is full, no more workers, we shall move on and heal later.
@@ -723,7 +730,7 @@ func (h *healSequence) queueHealTask(source healSource, healType madmin.HealItem
 	select {
 	case globalBackgroundHealRoutine.tasks <- task:
 		if serverDebugLog {
-			logger.Info("Task in the queue: %#v", task)
+			fmt.Printf("Task in the queue: %#v\n", task)
 		}
 	case <-h.ctx.Done():
 		return nil
@@ -800,7 +807,7 @@ func (h *healSequence) healItems(objAPI ObjectLayer, bucketsOnly bool) error {
 func (h *healSequence) traverseAndHeal(objAPI ObjectLayer) {
 	bucketsOnly := false // Heals buckets and objects also.
 	h.traverseAndHealDoneCh <- h.healItems(objAPI, bucketsOnly)
-	close(h.traverseAndHealDoneCh)
+	xioutil.SafeClose(h.traverseAndHealDoneCh)
 }
 
 // healMinioSysMeta - heals all files under a given meta prefix, returns a function

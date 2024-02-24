@@ -47,6 +47,7 @@ import (
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/certs"
 	"github.com/minio/pkg/v2/env"
@@ -89,7 +90,7 @@ var ServerFlags = []cli.Flag{
 	cli.DurationFlag{
 		Name:   "idle-timeout",
 		Value:  xhttp.DefaultIdleTimeout,
-		Usage:  "idle timeout is the maximum amount of time to wait for the next request when keep-alives are enabled",
+		Usage:  "idle timeout is the maximum amount of time to wait for the next request when keep-alive are enabled",
 		EnvVar: "MINIO_IDLE_TIMEOUT",
 		Hidden: true,
 	},
@@ -99,6 +100,12 @@ var ServerFlags = []cli.Flag{
 		Usage:  "read header timeout is the amount of time allowed to read request headers",
 		EnvVar: "MINIO_READ_HEADER_TIMEOUT",
 		Hidden: true,
+	},
+	cli.DurationFlag{
+		Name:   "conn-client-read-deadline",
+		Usage:  "custom connection READ deadline for incoming requests",
+		Hidden: true,
+		EnvVar: "MINIO_CONN_CLIENT_READ_DEADLINE",
 	},
 	cli.DurationFlag{
 		Name:   "conn-read-deadline",
@@ -133,6 +140,13 @@ var ServerFlags = []cli.Flag{
 		Hidden: true,
 		Value:  10 * time.Minute,
 		EnvVar: "MINIO_DNS_CACHE_TTL",
+	},
+	cli.IntFlag{
+		Name:   "max-idle-conns-per-host",
+		Usage:  "set a custom max idle connections per host value",
+		Hidden: true,
+		Value:  2048,
+		EnvVar: "MINIO_MAX_IDLE_CONNS_PER_HOST",
 	},
 	cli.StringSliceFlag{
 		Name:  "ftp",
@@ -329,9 +343,9 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 	// allow transport to be HTTP/1.1 for proxying.
 	globalProxyTransport = NewCustomHTTPProxyTransport()()
 	globalProxyEndpoints = GetProxyEndpoints(globalEndpoints)
-	globalInternodeTransport = NewInternodeHTTPTransport()()
+	globalInternodeTransport = NewInternodeHTTPTransport(ctxt.MaxIdleConnsPerHost)()
 	globalRemoteTargetTransport = NewRemoteTargetHTTPTransport(false)()
-
+	globalHealthChkTransport = NewHTTPTransport()
 	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
 		RoundTripper: NewHTTPTransportWithTimeout(1 * time.Hour),
@@ -343,8 +357,9 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 	})
 
 	globalTCPOptions = xhttp.TCPOptions{
-		UserTimeout: int(ctxt.UserTimeout.Milliseconds()),
-		Interface:   ctxt.Interface,
+		UserTimeout:       int(ctxt.UserTimeout.Milliseconds()),
+		ClientReadTimeout: ctxt.ConnClientReadDeadline,
+		Interface:         ctxt.Interface,
 	}
 
 	// On macOS, if a process already listens on LOCALIPADDR:PORT, net.Listen() falls back
@@ -381,7 +396,7 @@ func initAllSubsystems(ctx context.Context) {
 	}
 
 	// Create the bucket bandwidth monitor
-	globalBucketMonitor = bandwidth.NewMonitor(ctx, totalNodeCount())
+	globalBucketMonitor = bandwidth.NewMonitor(ctx, uint64(totalNodeCount()))
 
 	// Create a new config system.
 	globalConfigSys = NewConfigSys()
@@ -409,7 +424,7 @@ func initAllSubsystems(ctx context.Context) {
 		globalBucketVersioningSys = NewBucketVersioningSys()
 	}
 
-	// Create new bucket replication subsytem
+	// Create new bucket replication subsystem
 	globalBucketTargetSys = NewBucketTargetSys(GlobalContext)
 
 	// Create new ILM tier configuration subsystem
@@ -463,7 +478,7 @@ func bootstrapTraceMsg(msg string) {
 	globalBootstrapTracer.Record(info)
 
 	if serverDebugLog {
-		logger.Info(fmt.Sprint(time.Now().Round(time.Millisecond).Format(time.RFC3339), " bootstrap: ", msg))
+		fmt.Println(time.Now().Round(time.Millisecond).Format(time.RFC3339), " bootstrap: ", msg)
 	}
 
 	noSubs := globalTrace.NumSubscribers(madmin.TraceBootstrap) == 0
@@ -476,7 +491,7 @@ func bootstrapTraceMsg(msg string) {
 
 func bootstrapTrace(msg string, worker func()) {
 	if serverDebugLog {
-		logger.Info(fmt.Sprint(time.Now().Round(time.Millisecond).Format(time.RFC3339), " bootstrap: ", msg))
+		fmt.Println(time.Now().Round(time.Millisecond).Format(time.RFC3339), " bootstrap: ", msg)
 	}
 
 	now := time.Now()
@@ -725,7 +740,7 @@ func serverMain(ctx *cli.Context) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
-	// Initialize grid
+	// Initialize gridn
 	bootstrapTrace("initGrid", func() {
 		logger.FatalIf(initGlobalGrid(GlobalContext, globalEndpoints), "Unable to configure server grid RPC services")
 	})
@@ -737,7 +752,7 @@ func serverMain(ctx *cli.Context) {
 			logger.Fatal(config.ErrUnexpectedError(err), "Unable to configure one of server's RPC services")
 		}
 		// Allow grid to start after registering all services.
-		close(globalGridStart)
+		xioutil.SafeClose(globalGridStart)
 
 		httpServer := xhttp.NewServer(getServerListenAddrs()).
 			UseHandler(setCriticalErrorHandler(corsHandler(handler))).
@@ -767,7 +782,7 @@ func serverMain(ctx *cli.Context) {
 	if globalIsDistErasure {
 		bootstrapTrace("verifying system configuration", func() {
 			// Additionally in distributed setup, validate the setup and configuration.
-			if err := verifyServerSystemConfig(GlobalContext, globalEndpoints); err != nil {
+			if err := verifyServerSystemConfig(GlobalContext, globalEndpoints, globalGrid.Load()); err != nil {
 				logger.Fatal(err, "Unable to start the server")
 			}
 		})
@@ -1016,8 +1031,8 @@ func serverMain(ctx *cli.Context) {
 	globalMinioClient.SetAppInfo("minio-perf-test", ReleaseTag)
 
 	if serverDebugLog {
-		logger.Info("== DEBUG Mode enabled ==")
-		logger.Info("Currently set environment settings:")
+		fmt.Println("== DEBUG Mode enabled ==")
+		fmt.Println("Currently set environment settings:")
 		ks := []string{
 			config.EnvAccessKey,
 			config.EnvSecretKey,
@@ -1029,9 +1044,9 @@ func serverMain(ctx *cli.Context) {
 			if slices.Contains(ks, strings.Split(v, "=")[0]) {
 				continue
 			}
-			logger.Info(v)
+			fmt.Println(v)
 		}
-		logger.Info("======")
+		fmt.Println("======")
 	}
 
 	daemon.SdNotify(false, daemon.SdNotifyReady)

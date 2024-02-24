@@ -41,7 +41,7 @@ const (
 	dataUsageCacheName = ".usage-cache.bin"
 )
 
-// storeDataUsageInBackend will store all objects sent on the gui channel until closed.
+// storeDataUsageInBackend will store all objects sent on the dui channel until closed.
 func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan DataUsageInfo) {
 	attempts := 1
 	for dataUsageInfo := range dui {
@@ -155,7 +155,9 @@ func loadDataUsageFromBackend(ctx context.Context, objAPI ObjectLayer) (DataUsag
 			bui.ReplicationFailedSizeV1 > 0 || bui.ReplicationPendingCountV1 > 0 {
 			cfg, _ := getReplicationConfig(GlobalContext, bucket)
 			if cfg != nil && cfg.RoleArn != "" {
-				dataUsageInfo.ReplicationInfo = make(map[string]BucketTargetUsageInfo)
+				if dataUsageInfo.ReplicationInfo == nil {
+					dataUsageInfo.ReplicationInfo = make(map[string]BucketTargetUsageInfo)
+				}
 				dataUsageInfo.ReplicationInfo[cfg.RoleArn] = BucketTargetUsageInfo{
 					ReplicationFailedSize:   bui.ReplicationFailedSizeV1,
 					ReplicationFailedCount:  bui.ReplicationFailedCountV1,

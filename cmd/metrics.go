@@ -381,7 +381,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 
 	server := getLocalServerProperty(globalEndpoints, &http.Request{
 		Host: globalLocalNodeName,
-	})
+	}, true)
 
 	onlineDisks, offlineDisks := getOnlineOfflineDisksStats(server.Disks)
 	totalDisks := offlineDisks.Merge(onlineDisks)
@@ -406,7 +406,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		float64(GetTotalCapacityFree(server.Disks)),
 	)
 
-	sinfo := objLayer.StorageInfo(GlobalContext)
+	sinfo := objLayer.StorageInfo(GlobalContext, true)
 
 	// Report total usable capacity
 	ch <- prometheus.MustNewConstMetric(

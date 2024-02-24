@@ -235,7 +235,7 @@ func TestXLStorageReadVersionLegacy(t *testing.T) {
 		t.Fatalf("Unable to create a file \"as-file\", %s", err)
 	}
 
-	fi, err := xlStorage.ReadVersion(context.Background(), "exists-legacy", "as-file", "", ReadOptions{})
+	fi, err := xlStorage.ReadVersion(context.Background(), "", "exists-legacy", "as-file", "", ReadOptions{})
 	if err != nil {
 		t.Fatalf("Unable to read older 'xl.json' content: %s", err)
 	}
@@ -325,7 +325,7 @@ func TestXLStorageReadVersion(t *testing.T) {
 
 	// Run through all the test cases and validate for ReadVersion.
 	for i, testCase := range testCases {
-		_, err = xlStorage.ReadVersion(context.Background(), testCase.volume, testCase.path, "", ReadOptions{})
+		_, err = xlStorage.ReadVersion(context.Background(), "", testCase.volume, testCase.path, "", ReadOptions{})
 		if err != testCase.err {
 			t.Fatalf("TestXLStorage %d: Expected err \"%s\", got err \"%s\"", i+1, testCase.err, err)
 		}
@@ -858,7 +858,7 @@ func TestXLStorageListDir(t *testing.T) {
 
 	for i, testCase := range testCases {
 		var dirList []string
-		dirList, err = xlStorage.ListDir(context.Background(), testCase.srcVol, testCase.srcPath, -1)
+		dirList, err = xlStorage.ListDir(context.Background(), "", testCase.srcVol, testCase.srcPath, -1)
 		if err != testCase.expectedErr {
 			t.Errorf("TestXLStorage case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
@@ -1200,7 +1200,7 @@ func TestXLStorageReadFile(t *testing.T) {
 			if err == nil && err != testCase.expectedErr {
 				t.Errorf("Case: %d %#v, expected: %s, got :%s", i+1, testCase, testCase.expectedErr, err)
 			}
-			// Expected error retured, proceed further to validate the returned results.
+			// Expected error returned, proceed further to validate the returned results.
 			if err != nil && testCase.expectedErr == nil {
 				t.Errorf("Case: %d %#v, expected: %s, got :%s", i+1, testCase, testCase.expectedErr, err)
 			}
@@ -1404,7 +1404,7 @@ func TestXLStorageAppendFile(t *testing.T) {
 	}
 
 	// TestXLStorage case with invalid volume name.
-	// A valid volume name should be atleast of size 3.
+	// A valid volume name should be at least of size 3.
 	err = xlStorage.AppendFile(context.Background(), "bn", "yes", []byte("hello, world"))
 	if err != errVolumeNotFound {
 		t.Fatalf("expected: \"Invalid argument error\", got: \"%s\"", err)
@@ -1560,7 +1560,7 @@ func TestXLStorageRenameFile(t *testing.T) {
 			expectedErr: errVolumeNotFound,
 		},
 		// TestXLStorage case - 12.
-		// TestXLStorage case with invalid src volume name. Length should be atleast 3.
+		// TestXLStorage case with invalid src volume name. Length should be at least 3.
 		// Expecting to fail with `errInvalidArgument`.
 		{
 			srcVol:      "ab",
@@ -1570,7 +1570,7 @@ func TestXLStorageRenameFile(t *testing.T) {
 			expectedErr: errVolumeNotFound,
 		},
 		// TestXLStorage case - 13.
-		// TestXLStorage case with invalid destination volume name. Length should be atleast 3.
+		// TestXLStorage case with invalid destination volume name. Length should be at least 3.
 		// Expecting to fail with `errInvalidArgument`.
 		{
 			srcVol:      "abcd",
@@ -1580,7 +1580,7 @@ func TestXLStorageRenameFile(t *testing.T) {
 			expectedErr: errVolumeNotFound,
 		},
 		// TestXLStorage case - 14.
-		// TestXLStorage case with invalid destination volume name. Length should be atleast 3.
+		// TestXLStorage case with invalid destination volume name. Length should be at least 3.
 		// Expecting to fail with `errInvalidArgument`.
 		{
 			srcVol:      "abcd",
@@ -1657,7 +1657,7 @@ func TestXLStorageDeleteVersion(t *testing.T) {
 				Checksums:    nil,
 			},
 		}
-		if err := xl.WriteMetadata(ctx, volume, object, fi); err != nil {
+		if err := xl.WriteMetadata(ctx, "", volume, object, fi); err != nil {
 			t.Fatalf("Unable to create object, %s", err)
 		}
 	}
@@ -1666,7 +1666,7 @@ func TestXLStorageDeleteVersion(t *testing.T) {
 		t.Helper()
 		for i := range versions {
 			shouldExist := !deleted[i]
-			fi, err := xl.ReadVersion(ctx, volume, object, versions[i], ReadOptions{})
+			fi, err := xl.ReadVersion(ctx, "", volume, object, versions[i], ReadOptions{})
 			if shouldExist {
 				if err != nil {
 					t.Fatalf("Version %s should exist, but got err %v", versions[i], err)
@@ -1681,7 +1681,7 @@ func TestXLStorageDeleteVersion(t *testing.T) {
 
 	// Delete version 0...
 	checkVerExist(t)
-	err = xl.DeleteVersion(ctx, volume, object, FileInfo{Name: object, Volume: volume, VersionID: versions[0]}, false)
+	err = xl.DeleteVersion(ctx, volume, object, FileInfo{Name: object, Volume: volume, VersionID: versions[0]}, false, DeleteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1694,7 +1694,7 @@ func TestXLStorageDeleteVersion(t *testing.T) {
 		fis[0].Versions = append(fis[0].Versions, FileInfo{Name: object, Volume: volume, VersionID: versions[i]})
 		deleted[i] = true
 	}
-	errs := xl.DeleteVersions(ctx, volume, fis)
+	errs := xl.DeleteVersions(ctx, volume, fis, DeleteOptions{})
 	if errs[0] != nil {
 		t.Fatalf("expected nil error, got %v", errs[0])
 	}
@@ -1706,14 +1706,14 @@ func TestXLStorageDeleteVersion(t *testing.T) {
 		fis[0].Versions = append(fis[0].Versions, FileInfo{Name: object, Volume: volume, VersionID: versions[i]})
 		deleted[i] = true
 	}
-	errs = xl.DeleteVersions(ctx, volume, fis)
+	errs = xl.DeleteVersions(ctx, volume, fis, DeleteOptions{})
 	if errs[0] != nil {
 		t.Fatalf("expected nil error, got %v", errs[0])
 	}
 	checkVerExist(t)
 
 	// Meta should be deleted now...
-	fi, err := xl.ReadVersion(ctx, volume, object, "", ReadOptions{})
+	fi, err := xl.ReadVersion(ctx, "", volume, object, "", ReadOptions{})
 	if err != errFileNotFound {
 		t.Fatalf("Object %s should not exist, but returned: %#v", object, fi)
 	}
@@ -1871,7 +1871,7 @@ func TestXLStorageVerifyFile(t *testing.T) {
 	algo = HighwayHash256S
 	shardSize := int64(1024 * 1024)
 	shard := make([]byte, shardSize)
-	w := newStreamingBitrotWriter(storage, volName, fileName, size, algo, shardSize)
+	w := newStreamingBitrotWriter(storage, "", volName, fileName, size, algo, shardSize)
 	reader := bytes.NewReader(data)
 	for {
 		// Using io.Copy instead of this loop will not work for us as io.Copy

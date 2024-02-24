@@ -39,6 +39,7 @@ import (
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/s3select"
 	"github.com/minio/pkg/v2/env"
@@ -118,8 +119,8 @@ func (es *expiryState) PendingTasks() int {
 // close closes work channels exactly once.
 func (es *expiryState) close() {
 	es.once.Do(func() {
-		close(es.byDaysCh)
-		close(es.byNewerNoncurrentCh)
+		xioutil.SafeClose(es.byDaysCh)
+		xioutil.SafeClose(es.byNewerNoncurrentCh)
 	})
 }
 
@@ -394,12 +395,15 @@ func enqueueTransitionImmediate(obj ObjectInfo, src lcEventSrc) {
 //
 // 1. when a restored (via PostRestoreObject API) object expires.
 // 2. when a transitioned object expires (based on an ILM rule).
-func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *ObjectInfo, lcOpts lifecycle.ObjectOpts, lcEvent lifecycle.Event, src lcEventSrc) error {
+func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc) error {
 	traceFn := globalLifecycleSys.trace(*oi)
-	var opts ObjectOptions
-	opts.Versioned = globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name)
-	opts.VersionID = lcOpts.VersionID
-	opts.Expiration = ExpirationOptions{Expire: true}
+	opts := ObjectOptions{
+		Versioned:  globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+		Expiration: ExpirationOptions{Expire: true},
+	}
+	if lcEvent.Action.DeleteVersioned() {
+		opts.VersionID = oi.VersionID
+	}
 	tags := newLifecycleAuditEvent(src, lcEvent).Tags()
 	if lcEvent.Action.DeleteRestored() {
 		// delete locally restored copy of object or object version
@@ -434,13 +438,13 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
 	eventName := event.ObjectRemovedDelete
-	if lcOpts.DeleteMarker {
+	if oi.DeleteMarker {
 		eventName = event.ObjectRemovedDeleteMarkerCreated
 	}
 	objInfo := ObjectInfo{
 		Name:         oi.Name,
-		VersionID:    lcOpts.VersionID,
-		DeleteMarker: lcOpts.DeleteMarker,
+		VersionID:    oi.VersionID,
+		DeleteMarker: oi.DeleteMarker,
 	}
 	// Notify object deleted event.
 	sendEvent(eventArgs{
@@ -470,7 +474,14 @@ func genTransitionObjName(bucket string) (string, error) {
 // storage specified by the transition ARN, the metadata is left behind on source cluster and original content
 // is moved to the transition tier. Note that in the case of encrypted objects, entire encrypted stream is moved
 // to the transition tier without decrypting or re-encrypting.
-func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo, lae lcAuditEvent) error {
+func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo, lae lcAuditEvent) (err error) {
+	defer func() {
+		if err != nil {
+			return
+		}
+		globalScannerMetrics.timeILM(lae.Action)(1)
+	}()
+
 	opts := ObjectOptions{
 		Transition: TransitionOptions{
 			Status: lifecycle.TransitionPending,
@@ -507,9 +518,13 @@ func auditTierActions(ctx context.Context, tier string, bytes int64) func(err er
 		}
 
 		if err == nil {
-			op.TimeToResponseNS = time.Since(startTime).Nanoseconds()
+			since := time.Since(startTime)
+			op.TimeToResponseNS = since.Nanoseconds()
+			globalTierMetrics.Observe(tier, since)
+			globalTierMetrics.logSuccess(tier)
 		} else {
 			op.Error = err.Error()
+			globalTierMetrics.logFailure(tier)
 		}
 
 		logger.GetReqInfo(ctx).AppendTags("tierStats", op)

@@ -1298,7 +1298,7 @@ func (c *SiteReplicationSys) PeerGroupInfoChangeHandler(ctx context.Context, cha
 			}
 		}
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, errNoSuchGroup) {
 		return wrapSRErr(err)
 	}
 	return nil
@@ -3946,7 +3946,7 @@ func (c *SiteReplicationSys) EditPeerCluster(ctx context.Context, peer madmin.Pe
 				return madmin.ReplicateEditStatus{}, errSRInvalidRequest(fmt.Errorf("Endpoint %s not reachable: %w", peer.Endpoint, err))
 			}
 			if info.DeploymentID != v.DeploymentID {
-				return madmin.ReplicateEditStatus{}, errSRInvalidRequest(fmt.Errorf("Endpoint %s does not belong to deployment expected: %s (found %s) ", v.Endpoint, v.DeploymentID, info.DeploymentID))
+				return madmin.ReplicateEditStatus{}, errSRInvalidRequest(fmt.Errorf("Endpoint %s does not belong to deployment expected: %s (found %s) ", peer.Endpoint, v.DeploymentID, info.DeploymentID))
 			}
 		}
 	}
@@ -3980,6 +3980,9 @@ func (c *SiteReplicationSys) EditPeerCluster(ctx context.Context, peer madmin.Pe
 		}
 
 		if peer.DefaultBandwidth.IsSet {
+			if peer.DeploymentID == globalDeploymentID() {
+				return madmin.ReplicateEditStatus{}, errSRInvalidRequest(fmt.Errorf("invalid deployment id specified: expecting a peer deployment-id to be specified for restricting bandwidth from %s, found self %s", peer.Name, globalDeploymentID()))
+			}
 			pi.DefaultBandwidth = peer.DefaultBandwidth
 			pi.DefaultBandwidth.UpdatedAt = UTCNow()
 			successMsg = fmt.Sprintf("%s\n- default bandwidth %v for peer %s", successMsg, peer.DefaultBandwidth.Limit, peer.Name)
@@ -6016,6 +6019,7 @@ func (c *SiteReplicationSys) getSiteMetrics(ctx context.Context) (madmin.SRMetri
 		}
 		sm.ReplicaCount += peer.ReplicaCount
 		sm.ReplicaSize += peer.ReplicaSize
+		sm.Proxied.Add(madmin.ReplProxyMetric(peer.Proxied))
 		for dID, v := range peer.Metrics {
 			v2, ok := sm.Metrics[dID]
 			if !ok {

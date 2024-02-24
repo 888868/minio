@@ -162,7 +162,8 @@ func validateAdminSignature(ctx context.Context, r *http.Request, region string)
 	s3Err := ErrAccessDenied
 	if _, ok := r.Header[xhttp.AmzContentSha256]; ok &&
 		getRequestAuthType(r) == authTypeSigned {
-		// We only support admin credentials to access admin APIs.
+
+		// Get credential information from the request.
 		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
 		if s3Err != ErrNone {
 			return cred, owner, s3Err
@@ -256,7 +257,7 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
 		if err != nil {
 			// Base64 decoding fails, we should log to indicate
 			// something is malforming the request sent by client.
-			logger.LogIf(GlobalContext, err, logger.Application)
+			logger.LogIf(GlobalContext, err, logger.ErrorKind)
 			return nil, errAuthentication
 		}
 		claims.MapClaims[sessionPolicyNameExtracted] = string(spBytes)
@@ -291,6 +292,11 @@ func checkClaimsFromToken(r *http.Request, cred auth.Credentials) (map[string]in
 	if !cred.IsServiceAccount() && cred.IsTemp() && subtle.ConstantTimeCompare([]byte(token), []byte(cred.SessionToken)) != 1 {
 		// validate token for temporary credentials only.
 		return nil, ErrInvalidToken
+	}
+
+	// Expired credentials must return error right away.
+	if cred.IsTemp() && cred.IsExpired() {
+		return nil, toAPIErrorCode(r.Context(), errInvalidAccessKeyID)
 	}
 
 	secret := globalActiveCred.SecretKey
@@ -338,7 +344,7 @@ func checkRequestAuthTypeWithVID(ctx context.Context, r *http.Request, action po
 
 func authenticateRequest(ctx context.Context, r *http.Request, action policy.Action) (s3Err APIErrorCode) {
 	if logger.GetReqInfo(ctx) == nil {
-		logger.LogIf(ctx, errors.New("unexpected context.Context does not have a logger.ReqInfo"), logger.Minio)
+		logger.LogIf(ctx, errors.New("unexpected context.Context does not have a logger.ReqInfo"), logger.ErrorKind)
 		return ErrAccessDenied
 	}
 
@@ -377,7 +383,7 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 		// To extract region from XML in request body, get copy of request body.
 		payload, err := io.ReadAll(io.LimitReader(r.Body, maxLocationConstraintSize))
 		if err != nil {
-			logger.LogIf(ctx, err, logger.Application)
+			logger.LogIf(ctx, err, logger.ErrorKind)
 			return ErrMalformedXML
 		}
 

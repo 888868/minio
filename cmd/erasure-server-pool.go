@@ -38,7 +38,9 @@ import (
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/config/storageclass"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/sync/errgroup"
 	"github.com/minio/pkg/v2/wildcard"
@@ -70,17 +72,38 @@ func (z *erasureServerPools) SinglePool() bool {
 func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServerPools) (ObjectLayer, error) {
 	var (
 		deploymentID       string
-		distributionAlgo   string
 		commonParityDrives int
 		err                error
 
 		formats      = make([]*formatErasureV3, len(endpointServerPools))
 		storageDisks = make([][]StorageAPI, len(endpointServerPools))
 		z            = &erasureServerPools{
-			serverPools: make([]*erasureSets, len(endpointServerPools)),
-			s3Peer:      NewS3PeerSys(endpointServerPools),
+			serverPools:      make([]*erasureSets, len(endpointServerPools)),
+			s3Peer:           NewS3PeerSys(endpointServerPools),
+			distributionAlgo: formatErasureVersionV3DistributionAlgoV3,
 		}
 	)
+
+	// Maximum number of reusable buffers per node at any given point in time.
+	n := uint64(1024) // single node single/multiple drives set this to 1024 entries
+
+	if globalIsDistErasure {
+		n = 2048
+	}
+
+	if globalIsCICD {
+		n = 256 // 256MiB for CI/CD environments is sufficient
+	}
+
+	// Avoid allocating more than half of the available memory
+	if maxN := availableMemory() / (blockSizeV2 * 2); n > maxN {
+		n = maxN
+	}
+
+	// Initialize byte pool once for all sets, bpool size is set to
+	// setCount * setDriveCount with each memory upto blockSizeV2.
+	globalBytePoolCap = bpool.NewBytePoolCap(n, blockSizeV2, blockSizeV2*2)
+	globalBytePoolCap.Populate()
 
 	var localDrives []StorageAPI
 	local := endpointServerPools.FirstLocal()
@@ -101,8 +124,10 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			return nil, fmt.Errorf("parity validation returned an error: %w <- (%d, %d), for pool(%s)", err, commonParityDrives, ep.DrivesPerSet, humanize.Ordinal(i+1))
 		}
 
-		storageDisks[i], formats[i], err = waitForFormatErasure(local, ep.Endpoints, i+1,
-			ep.SetCount, ep.DrivesPerSet, deploymentID, distributionAlgo)
+		bootstrapTrace("waitForFormatErasure: loading disks", func() {
+			storageDisks[i], formats[i], err = waitForFormatErasure(local, ep.Endpoints, i+1,
+				ep.SetCount, ep.DrivesPerSet, deploymentID)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -112,26 +137,20 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			deploymentID = formats[i].ID
 		}
 
-		if distributionAlgo == "" {
-			distributionAlgo = formats[i].Erasure.DistributionAlgo
-		}
-
 		// Validate if users brought different DeploymentID pools.
 		if deploymentID != formats[i].ID {
 			return nil, fmt.Errorf("all pools must have same deployment ID - expected %s, got %s for pool(%s)", deploymentID, formats[i].ID, humanize.Ordinal(i+1))
 		}
 
-		z.serverPools[i], err = newErasureSets(ctx, ep, storageDisks[i], formats[i], commonParityDrives, i)
+		bootstrapTrace(fmt.Sprintf("newErasureSets: initializing %s pool", humanize.Ordinal(i+1)), func() {
+			z.serverPools[i], err = newErasureSets(ctx, ep, storageDisks[i], formats[i], commonParityDrives, i)
+		})
 		if err != nil {
 			return nil, err
 		}
 
 		if deploymentID != "" && bytes.Equal(z.deploymentID[:], []byte{}) {
 			z.deploymentID = uuid.MustParse(deploymentID)
-		}
-
-		if distributionAlgo != "" && z.distributionAlgo == "" {
-			z.distributionAlgo = distributionAlgo
 		}
 
 		for _, storageDisk := range storageDisks[i] {
@@ -159,8 +178,12 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 	setObjectLayer(z)
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	attempt := 1
 	for {
-		err := z.Init(ctx) // Initializes all pools.
+		var err error
+		bootstrapTrace(fmt.Sprintf("poolMeta.Init: loading pool metadata, attempt: %d", attempt), func() {
+			err = z.Init(ctx) // Initializes all pools.
+		})
 		if err != nil {
 			if !configRetriableErrors(err) {
 				logger.Fatal(err, "Unable to initialize backend")
@@ -168,6 +191,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			retry := time.Duration(r.Float64() * float64(5*time.Second))
 			logger.LogIf(ctx, fmt.Errorf("Unable to initialize backend: %w, retrying in %s", err, retry))
 			time.Sleep(retry)
+			attempt++
 			continue
 		}
 		break
@@ -597,7 +621,7 @@ func (z *erasureServerPools) BackendInfo() (b madmin.BackendInfo) {
 	return
 }
 
-func (z *erasureServerPools) LocalStorageInfo(ctx context.Context) StorageInfo {
+func (z *erasureServerPools) LocalStorageInfo(ctx context.Context, metrics bool) StorageInfo {
 	var storageInfo StorageInfo
 
 	storageInfos := make([]StorageInfo, len(z.serverPools))
@@ -605,7 +629,7 @@ func (z *erasureServerPools) LocalStorageInfo(ctx context.Context) StorageInfo {
 	for index := range z.serverPools {
 		index := index
 		g.Go(func() error {
-			storageInfos[index] = z.serverPools[index].LocalStorageInfo(ctx)
+			storageInfos[index] = z.serverPools[index].LocalStorageInfo(ctx, metrics)
 			return nil
 		}, index)
 	}
@@ -621,13 +645,13 @@ func (z *erasureServerPools) LocalStorageInfo(ctx context.Context) StorageInfo {
 	return storageInfo
 }
 
-func (z *erasureServerPools) StorageInfo(ctx context.Context) StorageInfo {
-	return globalNotificationSys.StorageInfo(z)
+func (z *erasureServerPools) StorageInfo(ctx context.Context, metrics bool) StorageInfo {
+	return globalNotificationSys.StorageInfo(z, metrics)
 }
 
 func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, healScanMode madmin.HealScanMode) error {
 	// Updates must be closed before we return.
-	defer close(updates)
+	defer xioutil.SafeClose(updates)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -654,7 +678,7 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 			results = append(results, dataUsageCache{})
 			go func(i int, erObj *erasureObjects) {
 				updates := make(chan dataUsageCache, 1)
-				defer close(updates)
+				defer xioutil.SafeClose(updates)
 				// Start update collector.
 				go func() {
 					defer wg.Done()
@@ -713,7 +737,7 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 				return
 			case v := <-updateCloser:
 				update()
-				close(v)
+				xioutil.SafeClose(v)
 				return
 			case <-updateTicker.C:
 				update()
@@ -1172,6 +1196,13 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 }
 
 func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error) {
+	if err := checkCopyObjArgs(ctx, srcBucket, srcObject); err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := checkCopyObjArgs(ctx, dstBucket, dstObject); err != nil {
+		return ObjectInfo{}, err
+	}
+
 	srcObject = encodeDirObject(srcObject)
 	dstObject = encodeDirObject(dstObject)
 
@@ -1280,7 +1311,10 @@ func (z *erasureServerPools) ListObjectVersions(ctx context.Context, bucket, pre
 
 	merged, err := z.listPath(ctx, &opts)
 	if err != nil && err != io.EOF {
-		return loi, err
+		if !isErrBucketNotFound(err) {
+			logger.LogOnceIf(ctx, err, "erasure-list-objects-path-"+bucket)
+		}
+		return loi, toObjectErr(err, bucket)
 	}
 	defer merged.truncate(0) // Release when returning
 
@@ -1429,6 +1463,12 @@ func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, ma
 			}
 			return loi, nil
 		}
+		if isErrBucketNotFound(err) {
+			return loi, err
+		}
+		if contextCanceled(ctx) {
+			return ListObjectsInfo{}, ctx.Err()
+		}
 	}
 
 	if len(prefix) > 0 && maxKeys == 1 && marker == "" {
@@ -1454,7 +1494,9 @@ func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, ma
 			loi.Objects = append(loi.Objects, objInfo)
 			return loi, nil
 		}
-
+		if isErrBucketNotFound(err) {
+			return ListObjectsInfo{}, err
+		}
 		if contextCanceled(ctx) {
 			return ListObjectsInfo{}, ctx.Err()
 		}
@@ -1465,7 +1507,7 @@ func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, ma
 		if !isErrBucketNotFound(err) {
 			logger.LogOnceIf(ctx, err, "erasure-list-objects-path-"+bucket)
 		}
-		return loi, err
+		return loi, toObjectErr(err, bucket)
 	}
 
 	merged.forwardPast(opts.Marker)
@@ -1510,7 +1552,7 @@ func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, ma
 }
 
 func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (ListMultipartsInfo, error) {
-	if err := checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, z); err != nil {
+	if err := checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter); err != nil {
 		return ListMultipartsInfo{}, err
 	}
 
@@ -1539,7 +1581,7 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 
 // Initiate a new multipart upload on a hashedSet based on object name.
 func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (*NewMultipartUploadResult, error) {
-	if err := checkNewMultipartArgs(ctx, bucket, object, z); err != nil {
+	if err := checkNewMultipartArgs(ctx, bucket, object); err != nil {
 		return nil, err
 	}
 
@@ -1586,7 +1628,7 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 
 // Copies a part of an object from source hashedSet to destination hashedSet.
 func (z *erasureServerPools) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset int64, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (PartInfo, error) {
-	if err := checkNewMultipartArgs(ctx, srcBucket, srcObject, z); err != nil {
+	if err := checkNewMultipartArgs(ctx, srcBucket, srcObject); err != nil {
 		return PartInfo{}, err
 	}
 
@@ -1596,7 +1638,7 @@ func (z *erasureServerPools) CopyObjectPart(ctx context.Context, srcBucket, srcO
 
 // PutObjectPart - writes part of an object to hashedSet based on the object name.
 func (z *erasureServerPools) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (PartInfo, error) {
-	if err := checkPutObjectPartArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err := checkPutObjectPartArgs(ctx, bucket, object, uploadID); err != nil {
 		return PartInfo{}, err
 	}
 
@@ -1628,7 +1670,7 @@ func (z *erasureServerPools) PutObjectPart(ctx context.Context, bucket, object, 
 }
 
 func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) (MultipartInfo, error) {
-	if err := checkListPartsArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err := checkListPartsArgs(ctx, bucket, object, uploadID); err != nil {
 		return MultipartInfo{}, err
 	}
 
@@ -1659,7 +1701,7 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 
 // ListObjectParts - lists all uploaded parts to an object in hashedSet.
 func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts ObjectOptions) (ListPartsInfo, error) {
-	if err := checkListPartsArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err := checkListPartsArgs(ctx, bucket, object, uploadID); err != nil {
 		return ListPartsInfo{}, err
 	}
 
@@ -1688,7 +1730,7 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 
 // Aborts an in-progress multipart operation on hashedSet based on the object name.
 func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error {
-	if err := checkAbortMultipartArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err := checkAbortMultipartArgs(ctx, bucket, object, uploadID); err != nil {
 		return err
 	}
 
@@ -1719,7 +1761,7 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 
 // CompleteMultipartUpload - completes a pending multipart transaction, on hashedSet based on object name.
 func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	if err = checkCompleteMultipartArgs(ctx, bucket, object, uploadID, z); err != nil {
+	if err = checkCompleteMultipartArgs(ctx, bucket, object, uploadID); err != nil {
 		return objInfo, err
 	}
 
@@ -1794,12 +1836,6 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 		// If site replication is configured, hold on to deleted bucket state until sites sync
 		if opts.SRDeleteOp == MarkDelete {
 			z.s3Peer.MakeBucket(context.Background(), pathJoin(minioMetaBucket, bucketMetaPrefix, deletedBucketsPrefix, bucket), MakeBucketOptions{})
-		}
-	}
-
-	if err != nil && !isErrBucketNotFound(err) {
-		if !opts.NoRecreate {
-			z.s3Peer.MakeBucket(ctx, bucket, MakeBucketOptions{})
 		}
 	}
 
@@ -1915,31 +1951,8 @@ func (z *erasureServerPools) HealFormat(ctx context.Context, dryRun bool) (madmi
 }
 
 func (z *erasureServerPools) HealBucket(ctx context.Context, bucket string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
-	r := madmin.HealResultItem{
-		Type:   madmin.HealItemBucket,
-		Bucket: bucket,
-	}
-
-	// Attempt heal on the bucket metadata, ignore any failures
-	hopts := opts
-	hopts.Recreate = false
-	defer z.HealObject(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, bucket, bucketMetadataFile), "", hopts)
-
-	for _, pool := range z.serverPools {
-		result, err := pool.HealBucket(ctx, bucket, opts)
-		if err != nil {
-			if _, ok := err.(BucketNotFound); ok {
-				continue
-			}
-			return result, err
-		}
-		r.DiskCount += result.DiskCount
-		r.SetCount += result.SetCount
-		r.Before.Drives = append(r.Before.Drives, result.Before.Drives...)
-		r.After.Drives = append(r.After.Drives, result.After.Drives...)
-	}
-
-	return r, nil
+	// .metadata.bin healing is not needed here, it is automatically healed via read() call.
+	return z.s3Peer.HealBucket(ctx, bucket, opts)
 }
 
 // Walk a bucket, optionally prefix recursively, until we have returned
@@ -1948,9 +1961,9 @@ func (z *erasureServerPools) HealBucket(ctx context.Context, bucket string, opts
 // error walker returns error. Optionally if context.Done() is received
 // then Walk() stops the walker.
 func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo, opts WalkOptions) error {
-	if err := checkListObjsArgs(ctx, bucket, prefix, "", z); err != nil {
+	if err := checkListObjsArgs(ctx, bucket, prefix, ""); err != nil {
 		// Upon error close the channel.
-		close(results)
+		xioutil.SafeClose(results)
 		return err
 	}
 
@@ -1959,7 +1972,7 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		defer cancel()
-		defer close(results)
+		defer xioutil.SafeClose(results)
 
 		for _, erasureSet := range z.serverPools {
 			var wg sync.WaitGroup
@@ -1969,7 +1982,7 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 				go func() {
 					defer wg.Done()
 
-					disks, _ := set.getOnlineDisksWithHealing(true)
+					disks, infos, _ := set.getOnlineDisksWithHealingAndInfo(true)
 					if len(disks) == 0 {
 						cancel()
 						return
@@ -1986,7 +1999,17 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 
 					askDisks := getListQuorum(opts.AskDisks, set.setDriveCount)
 					if askDisks == -1 {
-						askDisks = getListQuorum("strict", set.setDriveCount)
+						newDisks := getQuorumDisks(disks, infos, (len(disks)+1)/2)
+						if newDisks != nil {
+							// If we found disks signature in quorum, we proceed to list
+							// from a single drive, shuffling of the drives is subsequently.
+							disks = newDisks
+							askDisks = 1
+						} else {
+							// If we did not find suitable disks, perform strict quorum listing
+							// as no disk agrees on quorum anymore.
+							askDisks = getListQuorum("strict", set.setDriveCount)
+						}
 					}
 
 					// Special case: ask all disks if the drive count is 4
@@ -2253,7 +2276,7 @@ const (
 	vmware = "VMWare"
 )
 
-// HealthOptions takes input options to return sepcific information
+// HealthOptions takes input options to return specific information
 type HealthOptions struct {
 	Maintenance    bool
 	DeploymentType string
@@ -2264,50 +2287,21 @@ type HealthOptions struct {
 // was queried
 type HealthResult struct {
 	Healthy       bool
+	HealthyRead   bool
 	HealingDrives int
 	ESHealth      []struct {
 		Maintenance   bool
 		PoolID, SetID int
+		Healthy       bool
+		HealthyRead   bool
 		HealthyDrives int
+		HealingDrives int
+		ReadQuorum    int
 		WriteQuorum   int
 	}
 	WriteQuorum   int
+	ReadQuorum    int
 	UsingDefaults bool
-}
-
-// ReadHealth returns if the cluster can serve read requests
-func (z *erasureServerPools) ReadHealth(ctx context.Context) bool {
-	erasureSetUpCount := make([][]int, len(z.serverPools))
-	for i := range z.serverPools {
-		erasureSetUpCount[i] = make([]int, len(z.serverPools[i].sets))
-	}
-
-	diskIDs := globalNotificationSys.GetLocalDiskIDs(ctx)
-	diskIDs = append(diskIDs, getLocalDiskIDs(z))
-
-	for _, localDiskIDs := range diskIDs {
-		for _, id := range localDiskIDs {
-			poolIdx, setIdx, _, err := z.getPoolAndSet(id)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				continue
-			}
-			erasureSetUpCount[poolIdx][setIdx]++
-		}
-	}
-
-	b := z.BackendInfo()
-	poolReadQuorums := make([]int, len(b.StandardSCData))
-	copy(poolReadQuorums, b.StandardSCData)
-
-	for poolIdx := range erasureSetUpCount {
-		for setIdx := range erasureSetUpCount[poolIdx] {
-			if erasureSetUpCount[poolIdx][setIdx] < poolReadQuorums[poolIdx] {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // Health - returns current status of the object layer health,
@@ -2315,55 +2309,51 @@ func (z *erasureServerPools) ReadHealth(ctx context.Context) bool {
 // can be used to query scenarios if health may be lost
 // if this node is taken down by an external orchestrator.
 func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) HealthResult {
-	erasureSetUpCount := make([][]int, len(z.serverPools))
+	reqInfo := (&logger.ReqInfo{}).AppendTags("maintenance", strconv.FormatBool(opts.Maintenance))
+
+	type setInfo struct {
+		online  int
+		healing int
+	}
+
+	var drivesHealing int
+
+	erasureSetUpCount := make([][]setInfo, len(z.serverPools))
 	for i := range z.serverPools {
-		erasureSetUpCount[i] = make([]int, len(z.serverPools[i].sets))
+		erasureSetUpCount[i] = make([]setInfo, len(z.serverPools[i].sets))
 	}
 
-	diskIDs := globalNotificationSys.GetLocalDiskIDs(ctx)
-	if !opts.Maintenance {
-		diskIDs = append(diskIDs, getLocalDiskIDs(z))
-	}
+	storageInfo := z.StorageInfo(ctx, false)
 
-	for _, localDiskIDs := range diskIDs {
-		for _, id := range localDiskIDs {
-			poolIdx, setIdx, _, err := z.getPoolAndSet(id)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				continue
+	for _, disk := range storageInfo.Disks {
+		if disk.PoolIndex > -1 && disk.SetIndex > -1 {
+			if disk.State == madmin.DriveStateOk {
+				si := erasureSetUpCount[disk.PoolIndex][disk.SetIndex]
+				si.online++
+				if disk.Healing {
+					si.healing++
+					drivesHealing++
+				}
+				erasureSetUpCount[disk.PoolIndex][disk.SetIndex] = si
 			}
-			erasureSetUpCount[poolIdx][setIdx]++
 		}
 	}
 
-	reqInfo := (&logger.ReqInfo{}).AppendTags("maintenance", strconv.FormatBool(opts.Maintenance))
-
 	b := z.BackendInfo()
+	poolReadQuorums := make([]int, len(b.StandardSCData))
 	poolWriteQuorums := make([]int, len(b.StandardSCData))
 	for i, data := range b.StandardSCData {
+		poolReadQuorums[i] = data
 		poolWriteQuorums[i] = data
 		if data == b.StandardSCParity {
 			poolWriteQuorums[i] = data + 1
 		}
 	}
 
-	var aggHealStateResult madmin.BgHealState
 	// Check if disks are healing on in-case of VMware vsphere deployments.
 	if opts.Maintenance && opts.DeploymentType == vmware {
-		// check if local disks are being healed, if they are being healed
-		// we need to tell healthy status as 'false' so that this server
-		// is not taken down for maintenance
-		var err error
-		aggHealStateResult, err = getAggregatedBackgroundHealState(ctx, nil)
-		if err != nil {
-			logger.LogIf(logger.SetReqInfo(ctx, reqInfo), fmt.Errorf("Unable to verify global heal status: %w", err))
-			return HealthResult{
-				Healthy: false,
-			}
-		}
-
-		if len(aggHealStateResult.HealDisks) > 0 {
-			logger.LogIf(logger.SetReqInfo(ctx, reqInfo), fmt.Errorf("Total drives to be healed %d", len(aggHealStateResult.HealDisks)))
+		if drivesHealing > 0 {
+			logger.LogIf(logger.SetReqInfo(ctx, reqInfo), fmt.Errorf("Total drives to be healed %d", drivesHealing))
 		}
 	}
 
@@ -2382,38 +2372,62 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 		}
 	}
 
+	var maximumReadQuorum int
+	for _, readQuorum := range poolReadQuorums {
+		if maximumReadQuorum == 0 {
+			maximumReadQuorum = readQuorum
+		}
+		if readQuorum > maximumReadQuorum {
+			maximumReadQuorum = readQuorum
+		}
+	}
+
 	result := HealthResult{
 		Healthy:       true,
 		WriteQuorum:   maximumWriteQuorum,
+		ReadQuorum:    maximumReadQuorum,
 		UsingDefaults: usingDefaults, // indicates if config was not initialized and we are using defaults on this node.
 	}
 
 	for poolIdx := range erasureSetUpCount {
 		for setIdx := range erasureSetUpCount[poolIdx] {
 			result.ESHealth = append(result.ESHealth, struct {
-				Maintenance                bool
-				PoolID, SetID              int
-				HealthyDrives, WriteQuorum int
+				Maintenance                  bool
+				PoolID, SetID                int
+				Healthy                      bool
+				HealthyRead                  bool
+				HealthyDrives, HealingDrives int
+				ReadQuorum, WriteQuorum      int
 			}{
 				Maintenance:   opts.Maintenance,
 				SetID:         setIdx,
 				PoolID:        poolIdx,
-				HealthyDrives: erasureSetUpCount[poolIdx][setIdx],
+				Healthy:       erasureSetUpCount[poolIdx][setIdx].online >= poolWriteQuorums[poolIdx],
+				HealthyRead:   erasureSetUpCount[poolIdx][setIdx].online >= poolReadQuorums[poolIdx],
+				HealthyDrives: erasureSetUpCount[poolIdx][setIdx].online,
+				HealingDrives: erasureSetUpCount[poolIdx][setIdx].healing,
+				ReadQuorum:    poolReadQuorums[poolIdx],
 				WriteQuorum:   poolWriteQuorums[poolIdx],
 			})
 
-			if erasureSetUpCount[poolIdx][setIdx] < poolWriteQuorums[poolIdx] {
+			result.Healthy = erasureSetUpCount[poolIdx][setIdx].online >= poolWriteQuorums[poolIdx]
+			if !result.Healthy {
 				logger.LogIf(logger.SetReqInfo(ctx, reqInfo),
 					fmt.Errorf("Write quorum may be lost on pool: %d, set: %d, expected write quorum: %d",
 						poolIdx, setIdx, poolWriteQuorums[poolIdx]))
-				result.Healthy = false
+			}
+			result.HealthyRead = erasureSetUpCount[poolIdx][setIdx].online >= poolReadQuorums[poolIdx]
+			if !result.HealthyRead {
+				logger.LogIf(logger.SetReqInfo(ctx, reqInfo),
+					fmt.Errorf("Read quorum may be lost on pool: %d, set: %d, expected read quorum: %d",
+						poolIdx, setIdx, poolReadQuorums[poolIdx]))
 			}
 		}
 	}
 
 	if opts.Maintenance {
-		result.Healthy = result.Healthy && len(aggHealStateResult.HealDisks) == 0
-		result.HealingDrives = len(aggHealStateResult.HealDisks)
+		result.Healthy = result.Healthy && drivesHealing == 0
+		result.HealingDrives = drivesHealing
 	}
 
 	return result
@@ -2427,7 +2441,7 @@ func (z *erasureServerPools) PutObjectMetadata(ctx context.Context, bucket, obje
 	}
 
 	opts.MetadataChg = true
-	// We don't know the size here set 1GiB atleast.
+	// We don't know the size here set 1GiB at least.
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -2445,7 +2459,7 @@ func (z *erasureServerPools) PutObjectTags(ctx context.Context, bucket, object s
 
 	opts.MetadataChg = true
 
-	// We don't know the size here set 1GiB atleast.
+	// We don't know the size here set 1GiB at least.
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
 	if err != nil {
 		return ObjectInfo{}, err

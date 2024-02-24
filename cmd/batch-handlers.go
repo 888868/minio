@@ -47,12 +47,13 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/ioutil"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/console"
 	"github.com/minio/pkg/v2/env"
 	"github.com/minio/pkg/v2/policy"
 	"github.com/minio/pkg/v2/workers"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 var globalBatchConfig batch.Config
@@ -545,7 +546,7 @@ func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLa
 	}
 
 	go func() {
-		defer close(input)
+		defer xioutil.SafeClose(input)
 
 		for _, entry := range entries {
 			gr, err := objAPI.GetObjectNInfo(ctx, r.Source.Bucket,
@@ -924,6 +925,21 @@ func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo,
 	ri.countItem(info.Size, info.DeleteMarker, success)
 }
 
+func (ri *batchJobInfo) trackCurrentBucketBatch(bucket string, batch []ObjectInfo) {
+	if ri == nil {
+		return
+	}
+
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+
+	ri.Bucket = bucket
+	for i := range batch {
+		ri.Object = batch[i].Name
+		ri.countItem(batch[i].Size, batch[i].DeleteMarker, true)
+	}
+}
+
 // Start start the batch replication job, resumes if there was a pending job via "job.ID"
 func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job BatchJobRequest) error {
 	ri := &batchJobInfo{
@@ -1038,7 +1054,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 	if !*r.Source.Snowball.Disable && r.Source.Type.isMinio() && r.Target.Type.isMinio() {
 		go func() {
-			defer close(slowCh)
+			defer xioutil.SafeClose(slowCh)
 
 			// Snowball currently needs the high level minio-go Client, not the Core one
 			cl, err := miniogo.New(u.Host, &miniogo.Options{
@@ -1086,6 +1102,11 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 						for _, b := range batch {
 							slowCh <- b
 						}
+					} else {
+						ri.trackCurrentBucketBatch(r.Source.Bucket, batch)
+						globalBatchJobsMetrics.save(job.ID, ri)
+						// persist in-memory state to disk after every 10secs.
+						logger.LogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
 					}
 					batch = batch[:0]
 				}
@@ -1564,7 +1585,7 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 	}
 
 	job := &BatchJobRequest{}
-	if err = yaml.UnmarshalStrict(buf, job); err != nil {
+	if err = yaml.Unmarshal(buf, job); err != nil {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -1809,7 +1830,7 @@ func (j *BatchJobPool) queueJob(req *BatchJobRequest) error {
 	select {
 	case <-j.ctx.Done():
 		j.once.Do(func() {
-			close(j.jobCh)
+			xioutil.SafeClose(j.jobCh)
 		})
 	case j.jobCh <- req:
 	default:

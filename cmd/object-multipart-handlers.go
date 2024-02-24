@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net/http"
 	"net/url"
@@ -728,7 +729,21 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		sha256hex = ""
 	}
 
-	hashReader, err := hash.NewReader(ctx, reader, size, md5hex, sha256hex, actualSize)
+	var forceMD5 []byte
+	// Optimization: If SSE-KMS and SSE-C did not request Content-Md5. Use uuid as etag. Optionally enable this also
+	// for server that is started with `--no-compat`.
+	if !etag.ContentMD5Requested(r.Header) && (crypto.S3KMS.IsEncrypted(mi.UserDefined) || crypto.SSEC.IsRequested(r.Header) || !globalServerCtxt.StrictS3Compat) {
+		forceMD5 = mustGetUUIDBytes()
+	}
+
+	hashReader, err := hash.NewReaderWithOpts(ctx, reader, hash.Options{
+		Size:       size,
+		MD5Hex:     md5hex,
+		SHA256Hex:  sha256hex,
+		ActualSize: actualSize,
+		DisableMD5: false,
+		ForceMD5:   forceMD5,
+	})
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -1028,9 +1043,18 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 		Metadata:     cleanReservedKeys(objInfo.UserDefined),
 	})
 
-	if objInfo.NumVersions > dataScannerExcessiveVersionsThreshold {
+	if objInfo.NumVersions > int(scannerExcessObjectVersions.Load()) {
 		evt.EventName = event.ObjectManyVersions
 		sendEvent(evt)
+
+		auditLogInternal(context.Background(), AuditLogOptions{
+			Event:     "scanner:manyversions",
+			APIName:   "CompleteMultipartUpload",
+			Bucket:    objInfo.Bucket,
+			Object:    objInfo.Name,
+			VersionID: objInfo.VersionID,
+			Status:    http.StatusText(http.StatusOK),
+		})
 	}
 
 	// Remove the transitioned object whose object version is being overwritten.

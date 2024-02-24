@@ -73,12 +73,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 	if !skipAccessChecks(opts.Bucket) {
 		// Stat a volume entry.
 		if err = Access(volumeDir); err != nil {
-			if osIsNotExist(err) {
-				return errVolumeNotFound
-			} else if isSysErrIO(err) {
-				return errFaultyDisk
-			}
-			return err
+			return convertAccessError(err, errVolumeAccessDenied)
 		}
 	}
 
@@ -94,7 +89,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 	if err != nil {
 		return err
 	}
-	defer close(out)
+	defer xioutil.SafeClose(out)
 	var objsReturned int
 
 	objReturned := func(metadata []byte) {
@@ -169,7 +164,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 		if s.walkMu != nil {
 			s.walkMu.Lock()
 		}
-		entries, err := s.ListDir(ctx, opts.Bucket, current, -1)
+		entries, err := s.ListDir(ctx, "", opts.Bucket, current, -1)
 		if s.walkMu != nil {
 			s.walkMu.Unlock()
 		}
@@ -304,7 +299,11 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 			// If directory entry on stack before this, pop it now.
 			for len(dirStack) > 0 && dirStack[len(dirStack)-1] < meta.name {
 				pop := dirStack[len(dirStack)-1]
-				out <- metaCacheEntry{name: pop}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case out <- metaCacheEntry{name: pop}:
+				}
 				if opts.Recursive {
 					// Scan folder we found. Should be in correct sort order where we are.
 					err := scanDir(pop)
@@ -373,7 +372,11 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 				return ctx.Err()
 			}
 			pop := dirStack[len(dirStack)-1]
-			out <- metaCacheEntry{name: pop}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case out <- metaCacheEntry{name: pop}:
+			}
 			if opts.Recursive {
 				// Scan folder we found. Should be in correct sort order where we are.
 				logger.LogIf(ctx, scanDir(pop))
@@ -407,12 +410,12 @@ func (client *storageRESTClient) WalkDir(ctx context.Context, opts WalkDirOption
 	opts.DiskID = client.diskID
 	b, err := opts.MarshalMsg(grid.GetByteBuffer()[:0])
 	if err != nil {
-		return err
+		return toStorageErr(err)
 	}
 
 	st, err := client.gridConn.NewStream(ctx, grid.HandlerWalkDir, b)
 	if err != nil {
-		return err
+		return toStorageErr(err)
 	}
 	return toStorageErr(st.Results(func(in []byte) error {
 		_, err := wr.Write(in)

@@ -770,7 +770,7 @@ func readXLMetaNoData(r io.Reader, size int64) ([]byte, error) {
 		case 1, 2, 3:
 			sz, tmp, err := msgp.ReadBytesHeader(tmp)
 			if err != nil {
-				return nil, fmt.Errorf("readXLMetaNoData(read_meta): uknown metadata version %w", err)
+				return nil, fmt.Errorf("readXLMetaNoData(read_meta): unknown metadata version %w", err)
 			}
 			want := int64(sz) + int64(len(buf)-len(tmp))
 
@@ -1410,15 +1410,13 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 				err = x.setIdx(i, *ver)
 				return "", err
 			}
-			var err error
 			x.versions = append(x.versions[:i], x.versions[i+1:]...)
 			if fi.MarkDeleted && (fi.VersionPurgeStatus().Empty() || (fi.VersionPurgeStatus() != Complete)) {
 				err = x.addVersion(ventry)
+			} else if fi.Deleted && uv.String() == emptyUUID {
+				return "", x.addVersion(ventry)
 			}
-			// if we remove null version. we should try to add null version to top layer.
-			if uv.String() != emptyUUID {
-				return "", err
-			}
+			return "", err
 		case ObjectType:
 			if updateVersion && !fi.Deleted {
 				ver, err := x.getIdx(i)
@@ -1640,9 +1638,9 @@ func (x *xlMetaV2) AddVersion(fi FileInfo) error {
 			if len(k) > len(ReservedMetadataPrefixLower) && strings.EqualFold(k[:len(ReservedMetadataPrefixLower)], ReservedMetadataPrefixLower) {
 				// Skip tierFVID, tierFVMarker keys; it's used
 				// only for creating free-version.
-				// Skip xMinIOHealing, it's used only in RenameData
+				// Also skip xMinIOHealing, xMinIODataMov as used only in RenameData
 				switch k {
-				case tierFVIDKey, tierFVMarkerKey, xMinIOHealing:
+				case tierFVIDKey, tierFVMarkerKey, xMinIOHealing, xMinIODataMov:
 					continue
 				}
 

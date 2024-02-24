@@ -493,6 +493,30 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 		cred.ParentUser = base64.RawURLEncoding.EncodeToString(bs)
 	}
 
+	// Deny this assume role request if the policy that the user intends to bind
+	// has a sts:DurationSeconds condition, which is not satisfied as well
+	{
+		p := policyName
+		if p == "" {
+			var err error
+			_, p, err = globalIAMSys.GetRolePolicy(roleArnStr)
+			if err != nil {
+				writeSTSErrorResponse(ctx, w, ErrSTSAccessDenied, err)
+				return
+			}
+		}
+
+		if !globalIAMSys.doesPolicyAllow(p, policy.Args{
+			DenyOnly:        true,
+			Action:          policy.AssumeRoleWithWebIdentityAction,
+			ConditionValues: getSTSConditionValues(r, "", cred),
+			Claims:          cred.Claims,
+		}) {
+			writeSTSErrorResponse(ctx, w, ErrSTSAccessDenied, errors.New("this user does not have enough permission"))
+			return
+		}
+	}
+
 	// Set the newly generated credentials.
 	updatedAt, err := globalIAMSys.SetTempUser(ctx, cred.AccessKey, cred, policyName)
 	if err != nil {
@@ -723,7 +747,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	// We have to establish a TLS connection and the
 	// client must provide exactly one client certificate.
 	// Otherwise, we don't have a certificate to verify or
-	// the policy lookup would ambigious.
+	// the policy lookup would ambiguous.
 	if r.TLS == nil {
 		writeSTSErrorResponse(ctx, w, ErrSTSInsecureConnection, errors.New("No TLS connection attempt"))
 		return
@@ -732,7 +756,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	// A client may send a certificate chain such that we end up
 	// with multiple peer certificates. However, we can only accept
 	// a single client certificate. Otherwise, the certificate to
-	// policy mapping would be ambigious.
+	// policy mapping would be ambiguous.
 	// However, we can filter all CA certificates and only check
 	// whether they client has sent exactly one (non-CA) leaf certificate.
 	peerCertificates := make([]*x509.Certificate, 0, len(r.TLS.PeerCertificates))

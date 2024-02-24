@@ -69,6 +69,9 @@ type ObjectOptions struct {
 	Tagging                 bool // Is only in GET/HEAD operations to return tagging metadata along with regular metadata and body.
 
 	UserDefined         map[string]string   // only set in case of POST/PUT operations
+	ObjectAttributes    map[string]struct{} // Attribute tags defined by the users for the GetObjectAttributes request
+	MaxParts            int                 // used in GetObjectAttributes. Signals how many parts we should return
+	PartNumberMarker    int                 // used in GetObjectAttributes. Signals the part number after which results should be returned
 	PartNumber          int                 // only useful in case of GetObject/HeadObject
 	CheckPrecondFn      CheckPreconditionFn // only set during GetObject/HeadObject/CopyObjectPart preconditional valuation
 	EvalMetadataFn      EvalMetadataFn      // only set for retention settings, meant to be used only when updating metadata in-place.
@@ -105,6 +108,8 @@ type ObjectOptions struct {
 	// SkipRebalancing should be set to 'true' if the call should skip pools
 	// participating in a rebalance operation. Typically set for 'write' operations.
 	SkipRebalancing bool
+
+	DataMovement bool // indicates an going decommisionning or rebalacing
 
 	PrefixEnabledFn func(prefix string) bool // function which returns true if versioning is enabled on prefix
 
@@ -228,8 +233,8 @@ type ObjectLayer interface {
 	Shutdown(context.Context) error
 	NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, scanMode madmin.HealScanMode) error
 	BackendInfo() madmin.BackendInfo
-	StorageInfo(ctx context.Context) StorageInfo
-	LocalStorageInfo(ctx context.Context) StorageInfo
+	StorageInfo(ctx context.Context, metrics bool) StorageInfo
+	LocalStorageInfo(ctx context.Context, metrics bool) StorageInfo
 
 	// Bucket operations.
 	MakeBucket(ctx context.Context, bucket string, opts MakeBucketOptions) error
@@ -282,7 +287,6 @@ type ObjectLayer interface {
 
 	// Returns health of the backend
 	Health(ctx context.Context, opts HealthOptions) HealthResult
-	ReadHealth(ctx context.Context) bool
 
 	// Metadata operations
 	PutObjectMetadata(context.Context, string, string, ObjectOptions) (ObjectInfo, error)
